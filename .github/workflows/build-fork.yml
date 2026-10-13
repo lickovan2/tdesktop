@@ -1,0 +1,151 @@
+name: Fork build (Windows x64).
+
+# Сборка форка со своим api_id. Запуск вручную: Actions → Fork build → Run workflow.
+# Первый прогон собирает зависимости (Qt, FFmpeg, OpenSSL, Rust…) и может не
+# уложиться в 6 часов: кэш сохраняется в любом случае, повторный запуск
+# продолжает с места остановки (prepare.py пропускает готовые стадии).
+
+on:
+  workflow_dispatch:
+    inputs:
+      only_libs:
+        description: 'Собрать только зависимости (без Telegram.exe)'
+        type: boolean
+        default: false
+
+concurrency:
+  group: fork-build
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    env:
+      PREPARE_PATH: "Telegram/build/prepare/prepare.py"
+      QT: qt6
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Prepare directories.
+        run: |
+          mkdir %userprofile%\TBuild\Libraries
+          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Get repository name.
+        shell: bash
+        run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+
+      - name: Clone.
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+
+      - name: First set up.
+        shell: bash
+        run: |
+          DOCPATH=$TBUILD/$REPO_NAME/docs/building-win.md
+          SDK="$(grep "SDK version" $DOCPATH | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+          echo "$(sha256sum $TBUILD/$REPO_NAME/$PREPARE_PATH | awk '{ print $1 }')" >> CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
+          git config --global user.email "you@example.com"
+          git config --global user.name "Sample"
+
+      - uses: Eden-CI/msvc-dev-cmd@master
+        name: Native Tools Command Prompt.
+        with:
+          arch: x64
+          sdk: ${{ env.SDK }}
+          toolset: '14.44'
+
+      - name: NuGet sources.
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      # restore/save раздельно: стандартный actions/cache сохраняет только при
+      # успехе всей джобы, а первый прогон может упереться в таймаут.
+      - name: Restore ThirdParty.
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: fork-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            fork-third-party-${{ env.CACHE_KEY }}-
+            fork-third-party-
+
+      - name: Restore Libraries.
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.LibrariesPath }}
+          key: fork-libs-${{ env.QT }}-${{ env.CACHE_KEY }}-${{ github.run_id }}
+          restore-keys: |
+            fork-libs-${{ env.QT }}-${{ env.CACHE_KEY }}-
+            fork-libs-${{ env.QT }}-
+
+      - name: Libraries.
+        id: libs
+        timeout-minutes: 290
+        continue-on-error: true
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat skip-release silent %QT%
+
+      - name: Save ThirdParty.
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: fork-third-party-${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+      - name: Save Libraries.
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.LibrariesPath }}
+          key: fork-libs-${{ env.QT }}-${{ env.CACHE_KEY }}-${{ github.run_id }}
+
+      - name: Libraries not finished.
+        if: steps.libs.outcome != 'success'
+        shell: bash
+        run: |
+          echo "::warning::Зависимости собраны не полностью (таймаут или ошибка). Кэш сохранён — запусти workflow ещё раз."
+          exit 1
+
+      - name: Telegram Desktop build.
+        if: ${{ !inputs.only_libs }}
+        run: |
+          cd %TBUILD%\%REPO_NAME%\Telegram
+
+          call configure.bat x64 %QT% ^
+          -D TDESKTOP_API_ID=${{ secrets.TDESKTOP_API_ID }} ^
+          -D TDESKTOP_API_HASH=${{ secrets.TDESKTOP_API_HASH }} ^
+          -D CMAKE_CONFIGURATION_TYPES=Release ^
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
+
+          cmake --build ..\out --config Release --parallel
+
+      - name: Move artifact.
+        if: ${{ !inputs.only_libs }}
+        run: |
+          set OUT=%TBUILD%\%REPO_NAME%\out\Release
+          mkdir artifact
+          move %OUT%\Telegram.exe artifact/
+
+      - uses: actions/upload-artifact@v7
+        name: Upload artifact.
+        if: ${{ !inputs.only_libs }}
+        with:
+          name: Telegram-fork-x64
+          path: artifact\
+          retention-days: 14
